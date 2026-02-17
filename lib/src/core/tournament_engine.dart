@@ -32,7 +32,7 @@ class TournamentEngine {
       );
     }
 
-    _validateRoleFeasibility(activePlayers);
+    _validateRoleFeasibility(activePlayers, allowRelaxedConstraints: false);
 
     final random = Random(seed ?? DateTime.now().millisecondsSinceEpoch);
     final counters = PairingCounters();
@@ -54,6 +54,7 @@ class TournamentEngine {
         globalHashes: globalHashes,
         previousRoundHashes: previousRoundHashes,
         random: random,
+        allowRelaxedConstraints: false,
       );
 
       final matches = _pairTeamsGreedy(
@@ -63,14 +64,15 @@ class TournamentEngine {
         random: random,
       );
 
-      for (final team in teams) {
-        for (var i = 0; i < team.players.length; i++) {
-          for (var j = i + 1; j < team.players.length; j++) {
-            counters.incPlayedWith(team.players[i].id, team.players[j].id);
-          }
-        }
-        globalHashes.add(team.hash);
-      }
+      _updateCountersAndHashesForRound(
+        counters: counters,
+        globalHashes: globalHashes,
+        round: RoundPlanModel(
+          roundIndex: roundIndex,
+          teams: teams,
+          matches: matches,
+        ),
+      );
 
       previousRoundHashes = teams.map((t) => t.hash).toSet();
       rounds.add(
@@ -84,6 +86,91 @@ class TournamentEngine {
       teamTemplate: teamTemplate,
       rounds: rounds,
     );
+  }
+
+  List<RoundPlanModel> regenerateFutureRounds({
+    required List<Player> players,
+    required TeamSizePreference preference,
+    required int totalRounds,
+    required int startRoundIndex,
+    required List<RoundPlanModel> lockedRounds,
+    required bool allowRelaxedConstraints,
+    int? seed,
+  }) {
+    final activePlayers = players
+        .where((p) => p.activePool)
+        .toList(growable: false);
+
+    _validateRoleFeasibility(
+      activePlayers,
+      allowRelaxedConstraints: allowRelaxedConstraints,
+    );
+
+    final teamTemplate = _teamSizeSolver.solve(
+      playerCount: activePlayers.length,
+      preference: preference,
+    );
+
+    final random = Random(seed ?? DateTime.now().millisecondsSinceEpoch);
+    final counters = PairingCounters();
+    final globalHashes = <String>{};
+
+    for (final round in lockedRounds) {
+      _updateCountersAndHashesForRound(
+        counters: counters,
+        globalHashes: globalHashes,
+        round: round,
+      );
+    }
+
+    var previousRoundHashes = <String>{};
+    final prevRound = lockedRounds
+        .where((r) => r.roundIndex == startRoundIndex - 1)
+        .toList();
+    if (prevRound.isNotEmpty) {
+      previousRoundHashes = prevRound.first.teams.map((t) => t.hash).toSet();
+    }
+
+    final regenerated = <RoundPlanModel>[];
+    for (
+      var roundIndex = startRoundIndex;
+      roundIndex < totalRounds;
+      roundIndex++
+    ) {
+      final teams = _generateRoundTeams(
+        roundIndex: roundIndex,
+        players: activePlayers,
+        templateSizes: teamTemplate.sizes,
+        counters: counters,
+        globalHashes: globalHashes,
+        previousRoundHashes: previousRoundHashes,
+        random: random,
+        allowRelaxedConstraints: allowRelaxedConstraints,
+      );
+
+      final matches = _pairTeamsGreedy(
+        roundIndex: roundIndex,
+        teams: teams,
+        counters: counters,
+        random: random,
+      );
+
+      final round = RoundPlanModel(
+        roundIndex: roundIndex,
+        teams: teams,
+        matches: matches,
+      );
+      _updateCountersAndHashesForRound(
+        counters: counters,
+        globalHashes: globalHashes,
+        round: round,
+      );
+
+      previousRoundHashes = teams.map((t) => t.hash).toSet();
+      regenerated.add(round);
+    }
+
+    return regenerated;
   }
 
   List<RankingEntry> computeRanking({
@@ -164,6 +251,7 @@ class TournamentEngine {
     required Set<String> globalHashes,
     required Set<String> previousRoundHashes,
     required Random random,
+    required bool allowRelaxedConstraints,
   }) {
     final sortedSizes = templateSizes.toList()..sort((a, b) => b.compareTo(a));
 
@@ -177,6 +265,7 @@ class TournamentEngine {
       strictPreviousRound: true,
       random: random,
       attempts: 120,
+      allowRelaxedConstraints: allowRelaxedConstraints,
     );
 
     final relaxed =
@@ -191,6 +280,7 @@ class TournamentEngine {
           strictPreviousRound: false,
           random: random,
           attempts: 120,
+          allowRelaxedConstraints: allowRelaxedConstraints,
         );
 
     if (relaxed == null) {
@@ -212,6 +302,7 @@ class TournamentEngine {
     required bool strictPreviousRound,
     required Random random,
     required int attempts,
+    required bool allowRelaxedConstraints,
   }) {
     List<TeamAssignment>? best;
     var bestScore = _inf;
@@ -235,6 +326,7 @@ class TournamentEngine {
             globalHashes: globalHashes,
             previousRoundHashes: previousRoundHashes,
             strictPreviousRound: strictPreviousRound,
+            allowRelaxedConstraints: allowRelaxedConstraints,
           );
           if (score >= _inf) {
             continue;
@@ -245,7 +337,11 @@ class TournamentEngine {
               .where((p) => !pickedIds.contains(p.id))
               .toList(growable: false);
 
-          if (!_futureFeasible(futurePlayers, remainingSizes)) {
+          if (!_futureFeasible(
+            futurePlayers,
+            remainingSizes,
+            allowRelaxedConstraints: allowRelaxedConstraints,
+          )) {
             continue;
           }
 
@@ -288,9 +384,17 @@ class TournamentEngine {
     return best;
   }
 
-  bool _futureFeasible(List<Player> players, List<int> sizes) {
+  bool _futureFeasible(
+    List<Player> players,
+    List<int> sizes, {
+    required bool allowRelaxedConstraints,
+  }) {
     if (sizes.isEmpty) {
       return players.isEmpty;
+    }
+
+    if (allowRelaxedConstraints) {
+      return true;
     }
 
     final beginnerCount = _countBeginners(players);
@@ -312,6 +416,7 @@ class TournamentEngine {
     required Set<String> globalHashes,
     required Set<String> previousRoundHashes,
     required bool strictPreviousRound,
+    required bool allowRelaxedConstraints,
   }) {
     if (players.length < 2 || players.length > 3) {
       return _inf;
@@ -327,10 +432,12 @@ class TournamentEngine {
     }
 
     if (players.length == 2 && beginnerCount >= 2) {
-      return _inf;
+      if (!allowRelaxedConstraints) return _inf;
+      score += 120;
     }
     if (players.length == 3 && beginnerCount >= 2) {
-      return _inf;
+      if (!allowRelaxedConstraints) return _inf;
+      score += 120;
     }
 
     for (var i = 0; i < players.length; i++) {
@@ -339,9 +446,11 @@ class TournamentEngine {
         final b = players[j];
         final pairCost = _pairCost(a.role, b.role);
         if (pairCost >= _inf) {
-          return _inf;
+          if (!allowRelaxedConstraints) return _inf;
+          score += 60;
+        } else {
+          score += pairCost;
         }
-        score += pairCost;
         score += counters.playedWithCount(a.id, b.id) * _playedWithWeight;
       }
     }
@@ -427,6 +536,29 @@ class TournamentEngine {
     return matches;
   }
 
+  void _updateCountersAndHashesForRound({
+    required PairingCounters counters,
+    required Set<String> globalHashes,
+    required RoundPlanModel round,
+  }) {
+    for (final team in round.teams) {
+      for (var i = 0; i < team.players.length; i++) {
+        for (var j = i + 1; j < team.players.length; j++) {
+          counters.incPlayedWith(team.players[i].id, team.players[j].id);
+        }
+      }
+      globalHashes.add(team.hash);
+    }
+
+    for (final match in round.matches) {
+      for (final pa in match.teamA.players) {
+        for (final pb in match.teamB.players) {
+          counters.incFaced(pa.id, pb.id);
+        }
+      }
+    }
+  }
+
   double _crossTeamFacedCost(
     TeamAssignment a,
     TeamAssignment b,
@@ -468,7 +600,14 @@ class TournamentEngine {
     return ids.join('-');
   }
 
-  void _validateRoleFeasibility(List<Player> players) {
+  void _validateRoleFeasibility(
+    List<Player> players, {
+    required bool allowRelaxedConstraints,
+  }) {
+    if (allowRelaxedConstraints) {
+      return;
+    }
+
     final beginnerCount = players
         .where((p) => p.role == PlayerRole.beginner)
         .length;
